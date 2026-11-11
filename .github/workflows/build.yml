@@ -1,0 +1,402 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager "ndk;27.0.12077973" "cmake;3.22.1"
+
+      - name: Build Everything Automatically
+        run: |
+          # 1. Распаковка архива
+          mkdir -p build_dir
+          if ls *.zip 1> /dev/null 2>&1; then unzip -o *.zip -d build_dir
+          elif ls *.7z 1> /dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y p7zip-full; 7z x *.7z -obuild_dir
+          else cp -r . build_dir/; fi
+          
+          SETTINGS_FILE=$(find build_dir -name "settings.gradle" | head -n 1)
+          PROJECT_DIR=$(realpath $(dirname "$SETTINGS_FILE"))
+          cd "$PROJECT_DIR"
+          
+          # 2. settings.gradle
+          cat << 'EOF' > settings.gradle
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral(); maven { url 'https://jitpack.io' } }
+          }
+          rootProject.name = "OxideLauncher"
+          include ':app'
+          EOF
+          
+          # 3. app/build.gradle
+          cat << 'EOF' > app/build.gradle
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.example.oxidelauncher'
+              compileSdk 34
+              ndkVersion "27.0.12077973"
+              defaultConfig {
+                  applicationId "com.example.oxidelauncher"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt"; version "3.22.1" } }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          dependencies { implementation 'com.github.topjohnwu.libsu:core:5.2.2' }
+          EOF
+          
+          # 4. Клонируем ImGui и библиотеку хуков
+          cd app/src/main/cpp
+          git clone --depth 1 https://github.com/ocornut/imgui.git
+          git clone --depth 1 https://github.com/Rprop/And64InlineHook.git
+          
+          # 5. Создаем CMakeLists.txt
+          cat << 'EOF' > CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("oxide")
+          
+          add_library(injector_bin SHARED injector_bin.cpp)
+          target_link_libraries(injector_bin log dl)
+          
+          add_library(modmenu SHARED modmenu.cpp 
+              imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp
+              imgui/backends/imgui_impl_opengl3.cpp imgui/backends/imgui_impl_android.cpp
+              And64InlineHook/And64InlineHook.cpp
+          )
+          target_include_directories(modmenu PRIVATE imgui And64InlineHook)
+          
+          find_library(log-lib log)
+          find_library(android-lib android)
+          find_library(EGL-lib EGL)
+          find_library(GLESv3-lib GLESv3)
+          target_link_libraries(modmenu ${log-lib} ${android-lib} ${EGL-lib} ${GLESv3-lib} dl)
+          EOF
+          
+          # 6. Код Инжектора (injector_bin.cpp) - ИСПРАВЛЕНА JNI ФУНКЦИЯ
+          cat << 'EOF' > injector_bin.cpp
+          #include <jni.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <sys/ptrace.h>
+          #include <sys/wait.h>
+          #include <sys/mman.h>
+          #include <sys/uio.h>
+          #include <dlfcn.h>
+          #include <linux/elf.h>
+          #include <sys/user.h>
+          #include <android/log.h>
+          #include <errno.h>
+
+          #define LOG_TAG "InjectorBin"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+          // Вспомогательная функция (без JNI)
+          int do_inject(pid_t pid, const char* path) {
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) == -1) return 1; 
+              int status; waitpid(pid, &status, 0);
+              
+              char filename[64]; snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
+              FILE* fp = fopen(filename, "r"); 
+              if (!fp) { ptrace(PTRACE_DETACH, pid, 0, 0); return 2; }
+              char line[512]; uint64_t target_libc_base = 0;
+              while (fgets(line, sizeof(line), fp)) {
+                  if (strstr(line, "libc.so") && strstr(line, "r-xp")) {
+                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &target_libc_base); break;
+                  }
+              }
+              fclose(fp);
+              if (!target_libc_base) { ptrace(PTRACE_DETACH, pid, 0, 0); return 3; }
+
+              void* local_libc = dlopen("libc.so", RTLD_LAZY);
+              snprintf(filename, sizeof(filename), "/proc/%d/maps", getpid());
+              fp = fopen(filename, "r"); uint64_t local_libc_base = 0;
+              while (fgets(line, sizeof(line), fp)) {
+                  if (strstr(line, "libc.so") && strstr(line, "r-xp")) {
+                      sscanf(line, "%lx-%*lx %*s %*lx %*s %*s", &local_libc_base); break;
+                  }
+              }
+              fclose(fp);
+
+              uint64_t target_mmap = target_libc_base + ((uint64_t)dlsym(local_libc, "mmap") - local_libc_base);
+              uint64_t target_dlopen = target_libc_base + ((uint64_t)dlsym(local_libc, "dlopen") - local_libc_base);
+
+              struct user_pt_regs regs;
+              struct iovec io = { .iov_base = &regs, .iov_len = sizeof(regs) };
+              if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io) == -1) { ptrace(PTRACE_DETACH, pid, 0, 0); return 4; }
+              struct user_pt_regs saved_regs = regs;
+
+              uint64_t mmap_args[] = {0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0};
+              for(int i=0; i<6; i++) regs.regs[i] = mmap_args[i];
+              regs.pc = target_mmap;
+              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
+              ptrace(PTRACE_CONT, pid, 0, 0);
+              waitpid(pid, &status, 0);
+              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
+              uint64_t remote_mem = regs.regs[0];
+              if (!remote_mem) { ptrace(PTRACE_DETACH, pid, 0, 0); return 5; }
+
+              struct iovec local_iov = { .iov_base = (void*)path, .iov_len = strlen(path) + 1 };
+              struct iovec remote_iov = { .iov_base = (void*)remote_mem, .iov_len = strlen(path) + 1 };
+              process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
+
+              regs = saved_regs;
+              regs.regs[0] = remote_mem; regs.regs[1] = RTLD_NOW;
+              regs.pc = target_dlopen;
+              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
+              ptrace(PTRACE_CONT, pid, 0, 0);
+              waitpid(pid, &status, 0);
+              ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &io);
+              uint64_t handle = regs.regs[0];
+
+              ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &io);
+              ptrace(PTRACE_DETACH, pid, 0, 0);
+              return handle != 0 ? 0 : 6;
+          }
+
+          // Экспортируемая функция для Java (JNI)
+          extern "C" JNIEXPORT jint JNICALL
+          Java_com_example_oxidelauncher_MainActivity_runInjection(JNIEnv *env, jobject, jstring pid_str, jstring path_str) {
+              const char* pid_c = env->GetStringUTFChars(pid_str, 0);
+              const char* path = env->GetStringUTFChars(path_str, 0);
+              
+              pid_t pid = atoi(pid_c);
+              int result = do_inject(pid, path);
+              
+              env->ReleaseStringUTFChars(pid_str, pid_c);
+              env->ReleaseStringUTFChars(path_str, path);
+              return result;
+          }
+          EOF
+
+          # 7. Код Меню (modmenu.cpp) - С ОТЛАДКОЙ
+          cat << 'EOF' > modmenu.cpp
+          #include <jni.h>
+          #include <android/log.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <dlfcn.h>
+          #include "imgui/imgui.h"
+          #include "imgui/backends/imgui_impl_opengl3.h"
+          #include "imgui/backends/imgui_impl_android.h"
+          #include "And64InlineHook/And64InlineHook.hpp"
+
+          #define LOG_TAG "OxideCheat"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+          bool aimbot = false;
+          bool esp = false;
+          bool isInit = false;
+          int frameCount = 0;
+
+          EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay dpy, EGLSurface surface) = nullptr;
+
+          EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+              frameCount++;
+              if (frameCount % 100 == 0) {
+                  LOGI("HOOK IS WORKING! Frame: %d", frameCount);
+              }
+
+              if (!isInit) {
+                  isInit = true;
+                  IMGUI_CHECKVERSION();
+                  ImGui::CreateContext();
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)1080, (float)2400);
+                  ImGui::StyleColorsDark();
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  ImGui_ImplAndroid_Init(nullptr);
+                  LOGI("ImGui Initialized inside Hook!");
+              }
+
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui_ImplAndroid_NewFrame();
+              ImGui::NewFrame();
+
+              ImGui::Begin("ROCKET CHEAT");
+              ImGui::Text("Hook is working!");
+              ImGui::Checkbox("Aimbot", &aimbot);
+              ImGui::Checkbox("ESP", &esp);
+              ImGui::End();
+
+              ImGui::Render();
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+              return orig_eglSwapBuffers(dpy, surface);
+          }
+
+          void* menu_thread(void*) {
+              sleep(5); // Ждем загрузки игры
+              LOGI("Trying to find eglSwapBuffers...");
+              
+              void* handle = dlopen("libEGL.so", RTLD_LAZY);
+              if (!handle) {
+                  LOGI("Failed to dlopen libEGL.so!");
+                  return nullptr;
+              }
+              
+              void* target = dlsym(handle, "eglSwapBuffers");
+              if (!target) {
+                  LOGI("Failed to find eglSwapBuffers!");
+                  return nullptr;
+              }
+              
+              LOGI("Found eglSwapBuffers at %p. Hooking...", target);
+              A64HookFunction(target, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+              LOGI("Hook installation finished!");
+              return nullptr;
+          }
+
+          __attribute__((constructor)) void init() {
+              LOGI("Library loaded in game!");
+              pthread_t t; pthread_create(&t, nullptr, menu_thread, nullptr);
+          }
+          EOF
+
+          # 8. Создаем Java файл
+          cd "$PROJECT_DIR"
+          mkdir -p app/src/main/java/com/example/oxidelauncher
+          cat << 'EOF' > app/src/main/java/com/example/oxidelauncher/MainActivity.java
+          package com.example.oxidelauncher;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.util.List;
+          import com.topjohnwu.superuser.Shell;
+
+          public class MainActivity extends Activity {
+              static { System.loadLibrary("injector_bin"); }
+              public native int runInjection(String pid, String path);
+
+              private final String TARGET_PACKAGE = "com.catsbit.oxidesurvivalisland";
+              private String customPluginPath = null;
+              private TextView btnAddPlugin;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+
+                  TextView btnLaunch = findViewById(R.id.btnLaunch);
+                  btnAddPlugin = findViewById(R.id.btnAddPlugin); 
+
+                  btnAddPlugin.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.setType("*/*");
+                      startActivityForResult(i, 100);
+                  });
+
+                  btnLaunch.setOnClickListener(v -> {
+                      new Thread(() -> doInject(TARGET_PACKAGE)).start();
+                  });
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == 100 && res == RESULT_OK && data != null) {
+                      try {
+                          InputStream in = getContentResolver().openInputStream(data.getData());
+                          File out = new File(getCacheDir(), "custom_plugin.so");
+                          FileOutputStream fos = new FileOutputStream(out);
+                          byte[] buf = new byte[8192]; int n;
+                          while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+                          fos.close(); in.close();
+                          customPluginPath = out.getAbsolutePath();
+                          btnAddPlugin.setText("Плагин: загружен");
+                      } catch (Exception e) {
+                          Toast.makeText(this, "Ошибка: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                      }
+                  }
+              }
+
+              private void doInject(String pkg) {
+                  runOnUiThread(() -> Toast.makeText(this, "Запускаем Oxide...", Toast.LENGTH_SHORT).show());
+                  Shell.cmd("monkey -p " + pkg + " 1").exec();
+
+                  int pid = -1;
+                  long startTime = System.currentTimeMillis();
+                  while (System.currentTimeMillis() - startTime < 15000) {
+                      List<String> out = Shell.cmd("pidof " + pkg).exec().getOut();
+                      if (!out.isEmpty()) {
+                          pid = Integer.parseInt(out.get(0).trim().split(" ")[0]);
+                          break;
+                      }
+                      try { Thread.sleep(300); } catch (Exception ignored) {}
+                  }
+
+                  if (pid == -1) {
+                      runOnUiThread(() -> Toast.makeText(this, "Игра не запустилась", Toast.LENGTH_LONG).show());
+                      return;
+                  }
+
+                  String finalPluginPath;
+                  if (customPluginPath != null) {
+                      finalPluginPath = customPluginPath;
+                  } else {
+                      File builtInMod = new File(getApplicationInfo().nativeLibraryDir, "libmodmenu.so");
+                      finalPluginPath = builtInMod.getAbsolutePath();
+                  }
+
+                  Shell.cmd("su -c 'cp " + finalPluginPath + " /data/local/tmp/mod.so'").exec();
+                  Shell.cmd("su -c 'chmod 755 /data/local/tmp/mod.so'").exec();
+                  Shell.cmd("su -c 'chcon u:object_r:system_file:s0 /data/local/tmp/mod.so'").exec();
+
+                  int resultCode = runInjection(String.valueOf(pid), "/data/local/tmp/mod.so");
+                  
+                  final String msg;
+                  if (resultCode == 0) msg = "УСПЕХ! Меню загружено (жди 5 сек).";
+                  else msg = "Ошибка код: " + resultCode;
+
+                  runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_LONG).show());
+              }
+          }
+          EOF
+
+          # 9. Запуск сборки
+          cd "$PROJECT_DIR"
+          if [ ! -f "gradlew" ]; then gradle wrapper; fi
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Launcher-APK
+          path: '**/app/build/outputs/apk/debug/app-debug.apk'
