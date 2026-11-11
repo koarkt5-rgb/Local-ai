@@ -5,8 +5,8 @@ on:
   workflow_dispatch:
     inputs:
       llama_tag:
-        description: "llama.cpp tag"
-        default: "b5000"
+        description: "llama.cpp tag (пусто = авто)"
+        default: ""
 
 permissions:
   contents: write
@@ -38,7 +38,12 @@ jobs:
         working-directory: project
         run: |
           TAG="${{ github.event.inputs.llama_tag }}"
-          if [ -z "$TAG" ]; then TAG="b5000"; fi
+          if [ -z "$TAG" ]; then
+            git ls-remote --tags --refs https://github.com/ggml-org/llama.cpp > tags.txt
+            TAG=$(sed 's#.*refs/tags/##' tags.txt | sed -n 's/^b\([0-9][0-9]*\)$/\1/p' | sort -n | awk '$1>=5000{print "b"$1; exit}')
+          fi
+          if [ -z "$TAG" ]; then echo "Не нашёл подходящий тег llama.cpp"; exit 1; fi
+          echo "Использую llama.cpp $TAG"
           rm -rf app/src/main/cpp/llama.cpp
           git clone --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp app/src/main/cpp/llama.cpp
           rm -rf app/src/main/cpp/llama.cpp/.git
